@@ -2,6 +2,14 @@
 
 **Permissionless credential bridging. Turn any authentication you already have — GitHub account, email, browser session — into a verifiable on-chain claim. No oracles, no MPC, no cooperation from the original service.**
 
+> ## ⚠️ Negative result: the build-integrity guarantee is broken (2026-08-24)
+>
+> **This construction does not provide the security it claims, and the fix is GitHub's to make, not this repo's.** The "isolated VM" the whole design rests on is not isolated from the organization that owns the repository. Since [custom runner images went GA (2026-03-26)](https://github.blog/changelog/2026-03-26-custom-images-for-github-hosted-runners-are-now-generally-available/), an org on a paid plan can boot an image it built on a larger runner, name that runner after a standard label, and serve a job pinned to `runs-on: ubuntu-24.04` from it. The runner reports `runner_environment: github-hosted`, passes `gh attestation verify --deny-self-hosted-runners`, and can rewrite the workflow's output before Sigstore signs it. Nothing in the signed attestation records the runner, its group, or its image, so a verifier cannot tell an honest build from a substituted one.
+>
+> Demonstrated end to end: [run 32670271551](https://github.com/gh-zktls-tester/capture-test/actions/runs/32670271551) attests a binary that prints `5` compiled from source that prints `4`; the minimal case, [run 32432324709](https://github.com/gh-zktls-tester/capture-test/actions/runs/32432324709), attests `sha256("5\n")` for a workflow whose only step is `echo 4`. The two runs, the shim, the forgery tests, and the general result are written up in [`research-note.md`](tasks/substitution-demo/research-note.md). The party who can do this is the repo's own org — exactly the party a consumer of its provenance is trusting.
+>
+> There is no signed-only fix in this repo, because the one discriminating field (`runner_group_id`) exists only in the unsigned, deletable jobs API. **It stays broken until GitHub carries the runner group into the Actions OIDC token, the certificate, and the SLSA predicate**, requested in [community discussion #205732](https://github.com/orgs/community/discussions/205732). Everything below holds only under a weaker threat model: the repository owner is trusted, and the adversary is an individual with no runner-admin rights.
+
 GitHub Actions runs your code in an isolated VM, and Sigstore signs an attestation binding the output to the exact commit SHA. A ZK proof compresses this for on-chain verification at ~3M gas. Because attestations bind to **commit SHA** (not repo ownership), anyone can fork a workflow and produce valid proofs — deployment is permissionless in the same sense as smart contracts.
 
 ---
@@ -107,8 +115,6 @@ Fetching the workflow at that commit SHA tells you exactly what executed. No cou
 | `email-challenge.yml` + `email-verify.yml` | Email ownership | No |
 | `tweet-capture.yml` | Tweet authorship | Yes |
 | `file-hash.yml` | File contents at commit | No |
-| `sealed-box.yml` | Multi-attestation sealed box | No |
-
 See [`workflow-templates/`](workflow-templates/) for ready-to-use templates and [`examples/workflows/`](examples/workflows/) for more examples including Twitter profile, GitHub contributions, and PayPal balance proofs.
 
 ---
@@ -297,41 +303,13 @@ $(cat identity-proof/claim.json)"'
 > | `FaucetEmpty` | No ETH left | Deposit to `0x72cd70d...` |
 > | `CertificateMismatch` | Certificate bytes were modified | Use `claim.json` as-is from the artifact |
 
-### Trustless Escrow
-
-**Post a bounty, get verifiable work, pay automatically.**
-
-The pattern: One agent posts a bounty with a prompt. Another agent forks the repo, does the work, runs a self-judging workflow where Claude evaluates the diff, and claims the bounty with a ZK proof.
-
-```bash
-# Worker claims bounty after Claude approves their diff
-cast send $ESCROW "claim(uint256,bytes,bytes32[],bytes)" ...
-```
-
-**No external judge needed.** Claude runs inside GitHub Actions—the worker triggers it but can't fake the response.
-
-See [ESCROW.md](ESCROW.md) for the full skill file, or [examples/self-judging-bounty/](examples/self-judging-bounty/) for a worked example.
-
 ---
 
-## Advanced Patterns
-
-### Sealed Box
-
-GitHub Actions workflows are ephemeral — secrets generated during a run are lost when it terminates. The sealed-box pattern shows how to build **persistent services from ephemeral runners**: the runner generates an RSA keypair, attests the public key mid-execution, accepts encrypted submissions, decrypts them, and attests the results. Both attestations share the same `run_id`, proving the entire lifecycle happened in one execution context.
-
-```bash
-# One command: dispatch, encrypt, submit, verify
-./examples/sealed-box/sealed-box.sh "my secret message"
-```
-
-No external binaries — uses `openssl` for RSA-OAEP encryption. See [docs/sealed-box.md](docs/sealed-box.md) for the pattern and trust model.
-
-### Cross-Attestation GroupAuth
+## TEE Interoperability
 
 **GitHub runners and Dstack TEEs as equal peers in a shared group.** Different attestation systems — Sigstore (GitHub) and KMS signature chains (Dstack) — registering on the same contract and onboarding each other.
 
-**GroupAuth (Base mainnet):** [`0xdd29de730b99b876f21f3ab5dafba6711ff2c6ac`](https://basescan.org/address/0xdd29de730b99b876f21f3ab5dafba6711ff2c6ac)
+**TEEInterop (Base mainnet):** [`0xdd29de730b99b876f21f3ab5dafba6711ff2c6ac`](https://basescan.org/address/0xdd29de730b99b876f21f3ab5dafba6711ff2c6ac)
 
 A group of agents needs to share a secret (an API key, a decryption key, a signing credential). New members prove their identity through *whatever attestation system they have* — GitHub proves via ZK-verified Sigstore attestations, Dstack TEEs prove via KMS signature chains — and existing members onboard them.
 
@@ -342,11 +320,11 @@ GitHub Runner A                    Dstack TEE (Phala Cloud)
   │──────────────┐  ┌────────────────│
   │              ▼  ▼                │
   │      ┌────────────────┐          │
-  │      │  GroupAuth.sol  │          │
-  │      │                 │          │
+  │      │ TEEInterop.sol  │         │
+  │      │                 │         │
   │      │  allowedCode[]  │◄─ owner adds commit SHAs + app IDs
-  │      │  members[]      │          │
-  │      │  onboarding[]   │          │
+  │      │  members[]      │         │
+  │      │  onboarding[]   │         │
   │      └────────────────┘          │
   │              │                   │
   │    MemberRegistered event        │
@@ -355,7 +333,7 @@ GitHub Runner A                    Dstack TEE (Phala Cloud)
   │                                  │ onboard(myId, newId, encryptedSecret)
   │                                  │
   │◄─── getOnboarding(myId) ────────│
-  │  "groupauth-demo-secret-v1"      │
+  │  encrypted group secret          │
 ```
 
 The TEE agent runs 24/7 on Phala Cloud, watching for new members and automatically posting the group secret. GitHub runners are ephemeral — they register, receive their onboarding message, and exit.
@@ -372,15 +350,34 @@ Both registration paths end at the same `_register(codeId, pubkey)`:
 | `registerGitHub` | ZK proof of Sigstore attestation | `bytes32(bytes20(commitSha))` |
 | `registerDstack` | KMS signature chain (app→KMS→root) | `bytes32(bytes20(appId))` |
 
-The faucet and email NFT are **oracle-style** — one-shot attestations that trigger on-chain state changes. GroupAuth is a **coprocessor** — on-chain logic mediates off-chain execution, with the blockchain as the coordination layer and ground truth for rollback protection.
+The faucet and email NFT are **oracle-style** — one-shot attestations that trigger on-chain state changes. TEEInterop is a **coprocessor** — on-chain logic mediates off-chain execution, with the blockchain as the coordination layer and ground truth for rollback protection.
 
-GroupAuth treats attestation as a pluggable interface — if you can prove you ran approved code, you're in. The same on-chain registry accepts Sigstore ZK proofs (GitHub), KMS signature chains (Dstack), and could accept hardware TEE attestations (SGX, Nitro). This enables:
+TEEInterop treats attestation as a pluggable interface — if you can prove you ran approved code, you're in. The same on-chain registry accepts Sigstore ZK proofs (GitHub), KMS signature chains (Dstack), and could accept hardware TEE attestations (SGX, Nitro). This enables:
 
 - **Hybrid networks** — TEEs for always-on services, GitHub runners for batch jobs
 - **Cross-cloud groups** — members from different TEE vendors joining the same group
 - **Incremental trust** — start with GitHub Actions (free, auditable), graduate members to hardware TEEs
 
-See [`contracts/examples/GroupAuth.sol`](contracts/examples/GroupAuth.sol) for the contract and [docs/groupauth-deployment.md](docs/groupauth-deployment.md) for deployment details.
+See [`contracts/examples/TEEInterop.sol`](contracts/examples/TEEInterop.sol) for the contract and [docs/teeinterop-deployment.md](docs/teeinterop-deployment.md) for deployment details.
+
+---
+
+## Prediction Market Oracle
+
+**Parimutuel prediction market settled by Sigstore-attested forum scraping.** GitHub Actions checks a Discourse forum for a keyword, produces an attested oracle result, and anyone can settle the contract with a ZK proof. No trusted settler — same trust model as the faucet.
+
+```
+Forum Post → GitHub Workflow → Sigstore Attestation → ZK Proof → PredictionMarket.sol
+```
+
+1. Create a market bound to a topic ID, keyword, oracle type, and commit SHA
+2. Users bet YES/NO (parimutuel pools)
+3. After the deadline, trigger `oracle-check.yml` with the market parameters
+4. The workflow checks the Ethereum Magicians forum and produces `oracle-result.json`
+5. Generate a ZK proof of the attested result
+6. Anyone calls `settle()` with the proof — trustless, permissionless
+
+See [`contracts/examples/PredictionMarket.sol`](contracts/examples/PredictionMarket.sol) for the contract and [`oracle/`](oracle/) for the oracle scripts and workflow.
 
 ---
 
@@ -424,14 +421,15 @@ See [docs/trust-model.md](docs/trust-model.md) for details.
 │   └── examples/
 │       ├── GitHubFaucet.sol        # Faucet demo
 │       ├── EmailNFT.sol            # Email identity NFT
-│       ├── GroupAuth.sol           # Cross-attestation group membership
+│       ├── TEEInterop.sol          # Cross-platform TEE membership
+│       ├── PredictionMarket.sol    # Forum oracle prediction market
 │       ├── SimpleEscrow.sol        # Basic bounty
 │       └── SelfJudgingEscrow.sol   # AI-judged bounty
 │
-├── examples/sealed-box/         # Multi-attestation sealed box
-│   ├── sealed-box.sh            # Full CLI orchestration
-│   ├── submit.sh                # Standalone submit helper
-│   └── verify-linkage.sh        # Verify attestation linkage
+├── oracle/                  # Prediction market oracle
+│   ├── check-forum.js       # Forum scraping oracle
+│   ├── settle-market.js     # Settlement helper
+│   └── test-anvil.sh        # Integration test
 │
 ├── workflow-templates/       # Ready-to-fork workflows
 │   ├── github-identity.yml   # Prove GitHub account
@@ -447,12 +445,18 @@ See [docs/trust-model.md](docs/trust-model.md) for details.
 
 ---
 
+### Other Examples
+
+- **Sealed Box** — Ephemeral keypair + encrypted submissions in a single workflow run. See [docs/sealed-box.md](docs/sealed-box.md) and [examples/sealed-box/](examples/sealed-box/)
+- **Self-Judging Escrow** — Trustless bounties where Claude evaluates work inside GitHub Actions. See [ESCROW.md](ESCROW.md) and [examples/self-judging-bounty/](examples/self-judging-bounty/)
+
+---
+
 ## Links
 
-- [ESCROW.md](ESCROW.md) — Agent escrow skill file
 - [Faucet Demo](docs/faucet.md) — Try it yourself
 - [Email Identity NFT](docs/email-login.md) — Email verification walkthrough
-- [Sealed Box](docs/sealed-box.md) — Multi-attestation pattern
+- [TEE Interop Deployment](docs/teeinterop-deployment.md) — Cross-platform TEE setup
 - [Trust Model](docs/trust-model.md) — Security guarantees
 - [Auditing Workflows](docs/auditing-workflows.md) — For verifiers
 - [Developer Guide](docs/developer-guide.md) — Circuit updates, deployment, architecture
