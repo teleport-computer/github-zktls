@@ -113,7 +113,7 @@ jobs:
             "${{ steps.parse.outputs.recipient }}" \
             --private-key "$RELAYER_KEY" \
             --rpc-url https://sepolia.base.org \
-            --gas-limit 3500000 \
+            --gas-limit 6000000 \
             --json 2>&1)
           EXIT_CODE=$?
           set -e
